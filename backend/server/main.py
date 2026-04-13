@@ -237,6 +237,27 @@ def _compute_indicators(df, indicator_list: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Label generation (Stage 4)
+# ---------------------------------------------------------------------------
+def _compute_labels(df) -> list:
+    """Return a label per row: 'invest' if Close > MA20, else 'no-invest'.
+
+    Rows where MA20 is not yet available (first 19 rows) receive None.
+    """
+    close = df["Close"].astype(float)
+    ma20  = close.rolling(20).mean()
+    labels = []
+    for c, m in zip(close, ma20):
+        if m != m:          # NaN check — rolling hasn't filled yet
+            labels.append(None)
+        elif c > m:
+            labels.append("invest")
+        else:
+            labels.append("no-invest")
+    return labels
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 @app.get("/health")
@@ -270,7 +291,8 @@ def ohlcv(
         inds    = _compute_indicators(df_cached, indicator_list) if indicator_list else {}
         metrics = _compute_summary_metrics(df_cached)
         summary = _compute_data_summary(df_cached)
-        return {"ticker": ticker, "data": cached_records, "indicators": inds, "metrics": metrics, "summary": summary}
+        labels  = _compute_labels(df_cached)
+        return {"ticker": ticker, "data": cached_records, "indicators": inds, "metrics": metrics, "summary": summary, "labels": labels}
 
     # Fetch from Yahoo Finance
     try:
@@ -280,7 +302,7 @@ def ohlcv(
 
     if df is None or df.empty:
         empty_summary = {"date_coverage": None, "row_count": 0, "missing_value_count": 0, "warnings": ["No data returned for the requested ticker and period."]}
-        return {"ticker": ticker, "data": [], "indicators": {}, "metrics": {"last_close": None, "period_return": None, "volatility_20d": None}, "summary": empty_summary}
+        return {"ticker": ticker, "data": [], "indicators": {}, "metrics": {"last_close": None, "period_return": None, "volatility_20d": None}, "summary": empty_summary, "labels": []}
 
     df = _flatten_df(df)
     records = _df_to_records(df)
@@ -289,8 +311,9 @@ def ohlcv(
     inds    = _compute_indicators(df, indicator_list) if indicator_list else {}
     metrics = _compute_summary_metrics(df)
     summary = _compute_data_summary(df)
+    labels  = _compute_labels(df)
 
-    return {"ticker": ticker, "data": records, "indicators": inds, "metrics": metrics, "summary": summary}
+    return {"ticker": ticker, "data": records, "indicators": inds, "metrics": metrics, "summary": summary, "labels": labels}
 
 
 @app.get("/compare")
@@ -351,3 +374,172 @@ def compare(
             dates = record_dates
 
     return {"tickers": list(series.keys()), "dates": dates, "series": series}
+
+
+# ---------------------------------------------------------------------------
+# Backtest strategy computation
+# ---------------------------------------------------------------------------
+def _run_backtest(df, labels: list, initial_capital: float) -> dict:
+    """
+    Simulate the label-based strategy vs buy-and-hold benchmark.
+
+    Strategy rule:
+      - "invest" day  → hold the stock (capture that day's return)
+      - "no-invest" / None day → stay in cash (return = 0)
+
+    Day 0 has no previous close so its return is treated as 0 for both curves.
+
+    Returns a dict with:
+      portfolio_value[]  — strategy equity curve
+      benchmark_value[]  — buy-and-hold equity curve
+      dates[]            — corresponding date strings
+    """
+    closes = df["Close"].astype(float).tolist()
+    dates  = df["Date"].astype(str).tolist()
+    n = len(closes)
+
+    port_val  = initial_capital
+    bench_val = initial_capital
+    portfolio_value = []
+    benchmark_value = []
+
+    for i in range(n):
+        if i == 0:
+            daily_return = 0.0
+        else:
+            prev = closes[i - 1]
+            daily_return = ((closes[i] - prev) / prev) if prev else 0.0
+
+        # Benchmark always invested
+        bench_val *= (1.0 + daily_return)
+
+        # Strategy only invested on "invest" days
+        if labels[i] == "invest":
+            port_val *= (1.0 + daily_return)
+
+        portfolio_value.append(round(port_val, 4))
+        benchmark_value.append(round(bench_val, 4))
+
+    return {
+        "dates":           dates,
+        "portfolio_value": portfolio_value,
+        "benchmark_value": benchmark_value,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backtest summary metrics
+# ---------------------------------------------------------------------------
+def _compute_backtest_summary(portfolio_value: list, benchmark_value: list, labels: list) -> dict:
+    """
+    Compute summary metrics from the equity curves and labels.
+
+    strategy_return  — total % return of the label-based strategy
+    buyhold_return   — total % return of buy-and-hold benchmark
+    max_drawdown     — largest peak-to-trough % decline in the strategy equity curve
+    invest_days      — number of rows where label == "invest"
+    """
+    if not portfolio_value or not benchmark_value:
+        return {
+            "strategy_return": None,
+            "buyhold_return":  None,
+            "max_drawdown":    None,
+            "invest_days":     0,
+        }
+
+    initial = portfolio_value[0]
+
+    strategy_return = round(((portfolio_value[-1] - initial) / initial) * 100, 2) if initial else None
+    buyhold_return  = round(((benchmark_value[-1] - initial) / initial) * 100, 2) if initial else None
+
+    # Max drawdown: largest % drop from a running peak
+    peak = portfolio_value[0]
+    max_dd = 0.0
+    for v in portfolio_value:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (peak - v) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+    max_drawdown = round(max_dd, 2)
+
+    invest_days = sum(1 for l in labels if l == "invest")
+
+    return {
+        "strategy_return": strategy_return,
+        "buyhold_return":  buyhold_return,
+        "max_drawdown":    max_drawdown,
+        "invest_days":     invest_days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backtest endpoint
+# ---------------------------------------------------------------------------
+@app.get("/backtest")
+def backtest(
+    ticker: str = "NVDA",
+    period: str = "1y",
+    interval: str = "1d",
+    initial_capital: float = 10000.0,
+):
+    # --- Input validation ---
+    ticker   = _validate_ticker(ticker)
+    period   = _validate_period(period)
+    interval = _validate_interval(interval)
+
+    if initial_capital <= 0:
+        raise HTTPException(status_code=400, detail="initial_capital must be greater than 0.")
+    if initial_capital > 1_000_000_000:
+        raise HTTPException(status_code=400, detail="initial_capital must be 1,000,000,000 or less.")
+
+    # Intraday intervals not meaningful for daily label-based strategy
+    if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Backtesting requires a daily or wider interval (1d, 1wk, 1mo).",
+        )
+
+    # --- Fetch / cache OHLCV ---
+    ttl = 300
+    cache_key = f"{ticker}:{period}:{interval}"
+    records = _cache_get(cache_key, ttl)
+
+    if records is None:
+        try:
+            import pandas as pd
+            df = yf.download(ticker, period=period, interval=interval, progress=False)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Yahoo Finance error: {exc}")
+
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail=f"No data returned for '{ticker}'.")
+
+        df = _flatten_df(df)
+        records = _df_to_records(df)
+        _cache_set(cache_key, records)
+
+    if len(records) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough data to run backtest (need at least 20 rows for MA20).",
+        )
+
+    import pandas as pd
+    df = pd.DataFrame(records)
+    labels = _compute_labels(df)
+
+    result  = _run_backtest(df, labels, initial_capital)
+    summary = _compute_backtest_summary(result["portfolio_value"], result["benchmark_value"], labels)
+
+    return {
+        "ticker":           ticker,
+        "period":           period,
+        "interval":         interval,
+        "initial_capital":  initial_capital,
+        "dates":            result["dates"],
+        "portfolio_value":  result["portfolio_value"],
+        "benchmark_value":  result["benchmark_value"],
+        "summary":          summary,
+    }

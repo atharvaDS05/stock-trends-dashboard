@@ -1,7 +1,7 @@
 import { useState } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
-  ResponsiveContainer, BarChart, Bar, ReferenceLine,
+  ResponsiveContainer, BarChart, Bar, ReferenceLine, ReferenceArea,
   ComposedChart, Legend,
 } from "recharts";
 
@@ -15,8 +15,23 @@ const INDICATOR_OPTIONS = [
 
 const COMPARE_COLORS = ["#60a5fa", "#34d399", "#f87171", "#fbbf24", "#a78bfa"];
 
+// ── Group consecutive same-label rows into spans ──────────────────────────────
+function getLabelSpans(labels) {
+  const spans = [];
+  let i = 0;
+  while (i < labels.length) {
+    const lbl = labels[i];
+    if (lbl === null) { i++; continue; }
+    let j = i;
+    while (j < labels.length && labels[j] === lbl) j++;
+    spans.push({ label: lbl, start: i, end: j - 1 });
+    i = j;
+  }
+  return spans;
+}
+
 // ── Pure-SVG candlestick chart ────────────────────────────────────────────────
-function CandlestickChart({ rows, height = 430, selectedIndicators, indicatorData }) {
+function CandlestickChart({ rows, height = 430, selectedIndicators, indicatorData, labels = [] }) {
   if (!rows.length) return null;
 
   const W = 1200;
@@ -68,6 +83,16 @@ function CandlestickChart({ rows, height = 430, selectedIndicators, indicatorDat
       style={{ width: "100%", height }}
       preserveAspectRatio="none"
     >
+      {/* Label background regions — invest=green, no-invest=red */}
+      {getLabelSpans(labels).map(({ label, start, end }, idx) => {
+        const x1 = padL + start * (plotW / rows.length);
+        const x2 = padL + (end + 1) * (plotW / rows.length);
+        return (
+          <rect key={idx} x={x1} y={padT} width={x2 - x1} height={plotH}
+            fill={label === "invest" ? "#22c55e" : "#ef4444"} fillOpacity={0.10} />
+        );
+      })}
+
       {/* Grid */}
       {yTicks.map((t, i) => (
         <line key={i} x1={padL} y1={toY(t)} x2={W - padR} y2={toY(t)}
@@ -146,8 +171,15 @@ export default function App() {
   const [indicatorData, setIndicatorData]     = useState({});
   const [metrics, setMetrics]                 = useState(null);
   const [summary, setSummary]                 = useState(null);
+  const [labels, setLabels]                   = useState([]);
   const [loading, setLoading]                 = useState(false);
   const [error, setError]                     = useState(null);
+
+  const [activeTab, setActiveTab]             = useState("price");
+
+  const [initialCapital, setInitialCapital]   = useState("10000");
+  const [backtestData, setBacktestData]       = useState(null);
+  const [backtestLoading, setBacktestLoading] = useState(false);
 
   const [compareInput, setCompareInput]       = useState("");
   const [compareTickers, setCompareTickers]   = useState([]);
@@ -208,6 +240,7 @@ export default function App() {
         setIndicatorData({});
         setMetrics(null);
         setSummary(json.summary || null);
+        setLabels([]);
         return;
       }
 
@@ -215,6 +248,7 @@ export default function App() {
       setIndicatorData(json.indicators || {});
       setMetrics(json.metrics || null);
       setSummary(json.summary || null);
+      setLabels(json.labels || []);
     } catch (e) {
       setError({ type: "network", message: e.message || "An unexpected error occurred." });
     } finally {
@@ -255,6 +289,39 @@ export default function App() {
       setError({ type: "network", message: e.message || "Comparison failed unexpectedly." });
     } finally {
       setCompareLoading(false);
+    }
+  }
+
+  async function runBacktest() {
+    setBacktestLoading(true);
+    setError(null);
+    try {
+      const url = `${API}/backtest?ticker=${ticker}&period=${period}&interval=${interval}&initial_capital=${initialCapital}`;
+      let res;
+      try {
+        res = await fetch(url);
+      } catch {
+        setError({ type: "network", message: "Cannot connect to the backend server. Make sure FastAPI is running on port 8000." });
+        return;
+      }
+      if (res.status === 400) {
+        const err = await res.json().catch(() => ({}));
+        setError({ type: "validation", message: err.detail || "Invalid parameters for backtest." });
+        return;
+      }
+      if (res.status === 502) {
+        setError({ type: "provider", message: "Yahoo Finance is currently unavailable. Please try again in a moment." });
+        return;
+      }
+      if (!res.ok) {
+        setError({ type: "network", message: `Unexpected server error (HTTP ${res.status}). Please try again.` });
+        return;
+      }
+      setBacktestData(await res.json());
+    } catch (e) {
+      setError({ type: "network", message: e.message || "Backtest failed unexpectedly." });
+    } finally {
+      setBacktestLoading(false);
     }
   }
 
@@ -396,6 +463,18 @@ export default function App() {
             </div>
           </div>
 
+          {/* Initial Capital */}
+          <div>
+            <span style={lbl}>Initial Capital ($)</span>
+            <input
+              type="number"
+              min="1"
+              value={initialCapital}
+              onChange={(e) => { setInitialCapital(e.target.value); setBacktestData(null); }}
+              style={fullSel}
+            />
+          </div>
+
           {/* Analyze button */}
           <button
             onClick={analyze}
@@ -516,9 +595,13 @@ export default function App() {
               color: "#0f172a",
             },
             {
-              label: "Rows",
-              value: rows.length > 0 ? rows.length.toLocaleString() : "—",
-              color: "#0f172a",
+              label: "Strategy Return",
+              value: backtestData?.summary?.strategy_return != null
+                ? `${backtestData.summary.strategy_return > 0 ? "+" : ""}${backtestData.summary.strategy_return.toFixed(2)}%`
+                : "—",
+              color: backtestData?.summary?.strategy_return == null
+                ? "#0f172a"
+                : backtestData.summary.strategy_return >= 0 ? "#16a34a" : "#dc2626",
             },
           ].map(({ label, value, color }) => (
             <div key={label} style={{
@@ -534,6 +617,28 @@ export default function App() {
                 {value}
               </p>
             </div>
+          ))}
+        </div>
+
+        {/* ── TAB BAR ── */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 20, borderBottom: "2px solid #e2e8f0" }}>
+          {[
+            { key: "price",    label: "Price & Indicators" },
+            { key: "backtest", label: "Backtest" },
+          ].map(({ key, label }) => (
+            <button key={key} onClick={() => setActiveTab(key)} style={{
+              padding: "9px 20px",
+              fontSize: 14,
+              fontWeight: 600,
+              border: "none",
+              borderBottom: activeTab === key ? "2px solid #3b82f6" : "2px solid transparent",
+              marginBottom: -2,
+              background: "none",
+              color: activeTab === key ? "#3b82f6" : "#64748b",
+              cursor: "pointer",
+            }}>
+              {label}
+            </button>
           ))}
         </div>
 
@@ -559,8 +664,106 @@ export default function App() {
           );
         })()}
 
+        {/* ── BACKTEST TAB ── */}
+        {activeTab === "backtest" && (() => {
+          const btChartData = backtestData
+            ? backtestData.dates.map((d, i) => ({
+                date:      d,
+                strategy:  backtestData.portfolio_value[i],
+                benchmark: backtestData.benchmark_value[i],
+              }))
+            : [];
+
+          return (
+            <div>
+              {/* Run button */}
+              {!backtestData && (
+                <div style={{ ...card, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div>
+                    <p style={{ margin: "0 0 4px 0", fontWeight: 700, fontSize: 15, color: "#0f172a" }}>Label-Based Backtest</p>
+                    <p style={{ margin: 0, fontSize: 13, color: "#64748b" }}>
+                      Simulates investing on "invest" days and holding cash on "no-invest" days vs buy-and-hold.
+                    </p>
+                  </div>
+                  <button onClick={runBacktest} disabled={backtestLoading}
+                    style={{ ...btnPrimary, whiteSpace: "nowrap", opacity: backtestLoading ? 0.7 : 1 }}>
+                    {backtestLoading ? "Running…" : "Run Backtest"}
+                  </button>
+                </div>
+              )}
+
+              {/* Equity curve chart */}
+              {backtestData && btChartData.length > 0 && (
+                <div style={card}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+                    <h3 style={{ margin: 0, fontSize: 20, color: "#0f172a" }}>Equity Curve — {backtestData.ticker}</h3>
+                    <button onClick={() => { setBacktestData(null); }} style={{ ...btnSec, fontSize: 13, padding: "6px 14px" }}>
+                      Reset
+                    </button>
+                  </div>
+                  <ResponsiveContainer width="100%" height={360}>
+                    <LineChart data={btChartData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis dataKey="date" hide />
+                      <YAxis stroke="#94a3b8" tickFormatter={(v) => `$${v.toLocaleString()}`} />
+                      <Tooltip
+                        contentStyle={ttStyle}
+                        formatter={(val, name) => [`$${val.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, name]}
+                      />
+                      <Legend />
+                      <Line type="monotone" dataKey="strategy"  dot={false} stroke="#3b82f6" name="Strategy"     strokeWidth={2} />
+                      <Line type="monotone" dataKey="benchmark" dot={false} stroke="#94a3b8" name="Buy & Hold"   strokeWidth={1.5} strokeDasharray="5 3" />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+
+              {/* Summary Metrics panel */}
+              {backtestData?.summary && (
+                <div style={card}>
+                  <h3 style={{ margin: "0 0 16px 0", fontSize: 18, color: "#0f172a" }}>Backtest Summary</h3>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+                    {[
+                      {
+                        label: "Buy & Hold Return",
+                        value: backtestData.summary.buyhold_return != null
+                          ? `${backtestData.summary.buyhold_return > 0 ? "+" : ""}${backtestData.summary.buyhold_return.toFixed(2)}%`
+                          : "—",
+                        color: backtestData.summary.buyhold_return == null ? "#0f172a"
+                          : backtestData.summary.buyhold_return >= 0 ? "#16a34a" : "#dc2626",
+                        bg: "#f8fafc",
+                      },
+                      {
+                        label: "Max Drawdown",
+                        value: backtestData.summary.max_drawdown != null
+                          ? `-${backtestData.summary.max_drawdown.toFixed(2)}%`
+                          : "—",
+                        color: "#dc2626",
+                        bg: "#fef2f2",
+                      },
+                      {
+                        label: "Invest Days",
+                        value: backtestData.summary.invest_days != null
+                          ? `${backtestData.summary.invest_days} / ${backtestData.portfolio_value.length}`
+                          : "—",
+                        color: "#0f172a",
+                        bg: "#f8fafc",
+                      },
+                    ].map(({ label, value, color, bg }) => (
+                      <div key={label} style={{ background: bg, border: "1px solid #e2e8f0", borderRadius: 8, padding: "14px 16px" }}>
+                        <p style={{ margin: "0 0 6px 0", fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.06em" }}>{label}</p>
+                        <p style={{ margin: 0, fontSize: 22, fontWeight: 700, color }}>{value}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {/* Charts */}
-        {hasData && (
+        {activeTab === "price" && hasData && (
           <>
             {/* Price */}
             <div style={card}>
@@ -571,6 +774,7 @@ export default function App() {
                   height={430}
                   selectedIndicators={selectedIndicators}
                   indicatorData={indicatorData}
+                  labels={labels}
                 />
               ) : (
                 <ResponsiveContainer width="100%" height={430}>
@@ -580,6 +784,13 @@ export default function App() {
                     <YAxis domain={["auto", "auto"]} stroke="#94a3b8" />
                     <Tooltip contentStyle={ttStyle} />
                     <Legend />
+                    {getLabelSpans(labels).map(({ label, start, end }, idx) => (
+                      <ReferenceArea key={idx}
+                        x1={chartData[start]?.date} x2={chartData[end]?.date}
+                        fill={label === "invest" ? "#22c55e" : "#ef4444"}
+                        fillOpacity={0.10} strokeOpacity={0}
+                      />
+                    ))}
                     <Line type="monotone" dataKey="close" dot={false} stroke="#3b82f6" name="Close" strokeWidth={1.5} />
                     {showBB && <Line type="monotone" dataKey="BB_upper"  dot={false} stroke="#a78bfa" name="BB Upper"  strokeDasharray="4 2" strokeWidth={1} />}
                     {showBB && <Line type="monotone" dataKey="BB_middle" dot={false} stroke="#a78bfa" name="BB Mid"    strokeWidth={1} />}
@@ -588,6 +799,53 @@ export default function App() {
                 </ResponsiveContainer>
               )}
             </div>
+
+            {/* Label Distribution */}
+            {labels.some((l) => l !== null) && (() => {
+              const investCount  = labels.filter((l) => l === "invest").length;
+              const noInvestCount = labels.filter((l) => l === "no-invest").length;
+              const total        = investCount + noInvestCount;
+              const investPct    = total > 0 ? ((investCount / total) * 100).toFixed(1) : "0.0";
+              const noInvestPct  = total > 0 ? ((noInvestCount / total) * 100).toFixed(1) : "0.0";
+              return (
+                <div style={card}>
+                  <h3 style={{ margin: "0 0 14px 0", fontSize: 20, color: "#0f172a" }}>Label Distribution</h3>
+
+                  {/* Count row */}
+                  <div style={{ display: "flex", gap: 16, marginBottom: 14 }}>
+                    <div style={{ flex: 1, background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 8, padding: "12px 16px" }}>
+                      <p style={{ margin: "0 0 4px 0", fontSize: 11, fontWeight: 700, color: "#16a34a", textTransform: "uppercase", letterSpacing: "0.06em" }}>Invest Days</p>
+                      <p style={{ margin: 0, fontSize: 28, fontWeight: 700, color: "#15803d", lineHeight: 1 }}>{investCount}</p>
+                      <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "#16a34a" }}>{investPct}% of labeled days</p>
+                    </div>
+                    <div style={{ flex: 1, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "12px 16px" }}>
+                      <p style={{ margin: "0 0 4px 0", fontSize: 11, fontWeight: 700, color: "#dc2626", textTransform: "uppercase", letterSpacing: "0.06em" }}>No-Invest Days</p>
+                      <p style={{ margin: 0, fontSize: 28, fontWeight: 700, color: "#b91c1c", lineHeight: 1 }}>{noInvestCount}</p>
+                      <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "#dc2626" }}>{noInvestPct}% of labeled days</p>
+                    </div>
+                    <div style={{ flex: 1, background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: "12px 16px" }}>
+                      <p style={{ margin: "0 0 4px 0", fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.06em" }}>Total Labeled</p>
+                      <p style={{ margin: 0, fontSize: 28, fontWeight: 700, color: "#0f172a", lineHeight: 1 }}>{total}</p>
+                      <p style={{ margin: "4px 0 0 0", fontSize: 12, color: "#64748b" }}>of {labels.length} rows</p>
+                    </div>
+                  </div>
+
+                  {/* Stacked bar */}
+                  <div style={{ height: 12, borderRadius: 6, overflow: "hidden", display: "flex", background: "#e2e8f0" }}>
+                    <div style={{ width: `${investPct}%`, background: "#22c55e", transition: "width 0.4s ease" }} />
+                    <div style={{ width: `${noInvestPct}%`, background: "#ef4444", transition: "width 0.4s ease" }} />
+                  </div>
+                  <div style={{ display: "flex", gap: 16, marginTop: 8 }}>
+                    <span style={{ fontSize: 12, color: "#16a34a", display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 2, background: "#22c55e", display: "inline-block" }} /> Invest
+                    </span>
+                    <span style={{ fontSize: 12, color: "#dc2626", display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ width: 10, height: 10, borderRadius: 2, background: "#ef4444", display: "inline-block" }} /> No-Invest
+                    </span>
+                  </div>
+                </div>
+              );
+            })()}
 
             {/* RSI */}
             {showRSI && (
@@ -644,7 +902,7 @@ export default function App() {
         )}
 
         {/* Empty state */}
-        {!hasData && !loading && !error && (
+        {activeTab === "price" && !hasData && !loading && !error && (
           <div style={{ ...card, color: "#64748b" }}>Enter a ticker and click Analyze.</div>
         )}
 
