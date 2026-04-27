@@ -457,7 +457,7 @@ export default function App() {
 
       {/* ── LEFT SIDEBAR ── */}
       <aside style={{
-        width: 272,
+        width: 300,
         minHeight: "100vh",
         background: "#ffffff",
         borderRight: "1px solid #e2e8f0",
@@ -468,7 +468,7 @@ export default function App() {
       }}>
         {/* Sidebar title */}
         <div style={{ marginBottom: 24, paddingBottom: 16, borderBottom: "1px solid #e2e8f0" }}>
-          <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#0f172a", lineHeight: 1.4 }}>
+          <h2 style={{ margin: 0, fontSize: 25, fontWeight: 700, color: "#0f172a", lineHeight: 1.4 }}>
             Stock Trends Analysis Dashboard
           </h2>
         </div>
